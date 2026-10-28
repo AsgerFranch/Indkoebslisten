@@ -115,10 +115,16 @@
       const hasRealMeta = Boolean(title);
 
       if (!title) {
-        const slug = decodeURIComponent(new URL(baseUrl).pathname.split("/").filter(Boolean).pop() || "")
-          .replace(/-\d{5,}$/, "")
-          .replace(/[-_]+/g, " ")
-          .trim();
+        // Pick the most descriptive path segment, skipping pure numbers (product ids like 9046670)
+        const segments = new URL(baseUrl).pathname
+          .split("/")
+          .filter(Boolean)
+          .map((s) => {
+            try { return decodeURIComponent(s); } catch { return s; }
+          })
+          .filter((s) => /[a-zæøå]/i.test(s));
+        const best = segments.sort((a, b) => b.length - a.length)[0] || "";
+        const slug = best.replace(/-\d{5,}$/, "").replace(/[-_]+/g, " ").trim();
         if (slug) title = slug[0].toUpperCase() + slug.slice(1);
       }
 
@@ -266,7 +272,20 @@
       const url = rawUrl.trim();
       const base = extractPreview("", url);
 
-      // CORS proxies first (no daily cap), parsed locally; Microlink last since its free tier is 50 requests/day
+      // 1) Jina reader: only proxy found that is reliable AND CORS-enabled for github.io; returns full HTML, parsed locally
+      try {
+        const res = await fetch(`https://r.jina.ai/${url}`, {
+          headers: { Accept: "application/json", "X-Return-Format": "html" },
+          signal: AbortSignal.timeout(15000),
+        });
+        if (res.ok) {
+          const j = await res.json();
+          const preview = extractPreview(j?.data?.html || "", url);
+          if (preview.hasRealMeta) return preview;
+        }
+      } catch {}
+
+      // 2) Other CORS proxies (flaky), 3) Microlink last since its free tier is 50 requests/day
       const proxies = [
         (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
         (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,

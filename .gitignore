@@ -1,0 +1,13 @@
+node_modules/
+.next/
+out/
+dist/
+.env*.local
+*.log
+.DS_Store
+Thumbs.db
+tsconfig.tsbuildinfo
+next-env.d.ts
+.agents/
+AGENTS.md
+

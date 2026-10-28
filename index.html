@@ -1,0 +1,973 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0f172a" />
+  <title>Indkøbsliste</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased min-h-screen">
+  <div id="app">
+    <div class="max-w-sm mx-auto px-4 py-20 text-center text-sm text-slate-400">Indlæser Indkøbsliste...</div>
+  </div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js";
+    import {
+      getAuth,
+      setPersistence,
+      browserLocalPersistence,
+      onAuthStateChanged,
+      signInWithEmailAndPassword,
+      createUserWithEmailAndPassword,
+      signInWithPopup,
+      GoogleAuthProvider,
+      signOut,
+    } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
+    import {
+      initializeFirestore,
+      doc,
+      onSnapshot,
+      setDoc,
+    } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
+
+    // --- Link preview & Vare/Butik parser (inlined so index.html works via file:// double-click AND GitHub Pages) ---
+    const NAMED_ENTITIES = {
+      amp: "&",
+      quot: '"',
+      apos: "'",
+      lt: "<",
+      gt: ">",
+      nbsp: " ",
+      aelig: "æ",
+      oslash: "ø",
+      aring: "å",
+      AElig: "Æ",
+      Oslash: "Ø",
+      Aring: "Å",
+    };
+
+    function decodeHtml(str) {
+      return String(str || "")
+        .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+        .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+        .replace(/&([a-zA-Z]+);/g, (m, name) => NAMED_ENTITIES[name] ?? m)
+        .trim();
+    }
+
+    function parseItemInput(raw, knownStores = []) {
+      const trimmed = String(raw || "").trim();
+      if (!trimmed) return null;
+      if (/^https?:\/\//i.test(trimmed)) {
+        return { title: trimmed, store: "Generelt", isUrl: true };
+      }
+      const slashIdx = trimmed.indexOf("/");
+      if (slashIdx === -1) {
+        return { title: trimmed, store: "Generelt", isUrl: false };
+      }
+      const title = trimmed.slice(0, slashIdx).trim();
+      const rawStore = trimmed.slice(slashIdx + 1).trim();
+      if (!title) return null;
+      if (!rawStore) return { title, store: "Generelt", isUrl: false };
+
+      const matched = knownStores.find((s) => s.toLowerCase() === rawStore.toLowerCase());
+      const store = matched || rawStore[0].toUpperCase() + rawStore.slice(1);
+      return { title, store, isUrl: false };
+    }
+
+    function extractPreview(html, baseUrl) {
+      const getMeta = (key) => {
+        const re = new RegExp(
+          `<meta[^>]+(?:property|name)=["']${key}["'][^>]+content=["']([^"']+)["']|<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${key}["']`,
+          "i"
+        );
+        const m = html.match(re);
+        return m ? decodeHtml(m[1] || m[2] || "") : "";
+      };
+
+      let ldTitle = "";
+      let ldImage = "";
+      const ldMatches = html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+      for (const m of ldMatches) {
+        try {
+          const parsed = JSON.parse(m[1]);
+          const nodes = Array.isArray(parsed) ? parsed : parsed["@graph"] || [parsed];
+          const prod = nodes.find((n) => n && /product/i.test(String(n["@type"] || "")));
+          if (prod) {
+            if (!ldTitle && prod.name) ldTitle = decodeHtml(String(prod.name));
+            const img = Array.isArray(prod.image) ? prod.image[0] : prod.image?.url || prod.image;
+            if (!ldImage && typeof img === "string") ldImage = img;
+          }
+        } catch {}
+      }
+
+      const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+      const rawTitle =
+        getMeta("og:title") ||
+        getMeta("twitter:title") ||
+        ldTitle ||
+        (titleMatch ? decodeHtml(titleMatch[1]) : "");
+
+      const isBlockedTitle = /^(access denied|just a moment|attention required|403 forbidden|robot check)/i.test(rawTitle);
+      let title = isBlockedTitle ? "" : rawTitle;
+      const hasRealMeta = Boolean(title);
+
+      if (!title) {
+        const slug = decodeURIComponent(new URL(baseUrl).pathname.split("/").filter(Boolean).pop() || "")
+          .replace(/-\d{5,}$/, "")
+          .replace(/[-_]+/g, " ")
+          .trim();
+        if (slug) title = slug[0].toUpperCase() + slug.slice(1);
+      }
+
+      const rawImage = isBlockedTitle ? "" : getMeta("og:image") || getMeta("twitter:image") || ldImage;
+      const hostLabel = new URL(baseUrl).hostname
+        .replace(/^www\./i, "")
+        .replace(/\.[a-z]{2,6}$/i, "")
+        .split(/[-_.]/)
+        .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ""))
+        .join(" ");
+      const ogSite = isBlockedTitle ? "" : getMeta("og:site_name");
+      const siteName = ogSite && !/^(forside|home|hjem|index|webshop)$/i.test(ogSite) ? ogSite : hostLabel;
+
+      let image = "";
+      if (rawImage) {
+        try {
+          const resolved = new URL(rawImage, baseUrl);
+          if (resolved.protocol === "http:" || resolved.protocol === "https:") image = resolved.href;
+        } catch {}
+      }
+
+      return { title, image, siteName, hasRealMeta };
+    }
+
+    // --- Firebase Configuration ---
+    const firebaseConfig = {
+      apiKey: "AIzaSyCqEJ5yRtTB1KjAG0RmnEsDNiXFJBKwUxo",
+      authDomain: "tempco2fugt.firebaseapp.com",
+      databaseURL: "https://tempco2fugt-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId: "tempco2fugt",
+      storageBucket: "tempco2fugt.firebasestorage.app",
+      messagingSenderId: "1068932962336",
+      appId: "1:1068932962336:web:aae16bb109b3d92f5a4445",
+      measurementId: "G-TDLMY89YWY",
+    };
+
+    const fbApp = initializeApp(firebaseConfig);
+    const auth = getAuth(fbApp);
+    const db = initializeFirestore(fbApp, { ignoreUndefinedProperties: true });
+    setPersistence(auth, browserLocalPersistence).catch(() => {});
+
+    const DEFAULT_STORES = {
+      Generelt: "bg-stone-100 text-stone-700 border-stone-300",
+      Netto: "bg-yellow-100 text-yellow-900 border-yellow-300",
+      "Rema 1000": "bg-sky-100 text-sky-900 border-sky-300",
+      "Føtex": "bg-indigo-100 text-indigo-900 border-indigo-300",
+      Lidl: "bg-blue-100 text-blue-900 border-blue-300",
+      Bilka: "bg-cyan-100 text-cyan-900 border-cyan-300",
+      IKEA: "bg-amber-100 text-amber-900 border-amber-300",
+    };
+
+    const ITEMS_KEY = "indkoeb_items_v1";
+    const STORES_KEY = "indkoeb_stores_v1";
+
+    let state = {
+      user: null,
+      localMode: false,
+      authReady: false,
+      isRegistering: false,
+      authError: null,
+      items: [],
+      customStores: [],
+      quickTitle: "",
+      activeStoreIdx: 0,
+      storeFilter: "Alle",
+      expandedId: null,
+      loadingPreviewId: null,
+      errorMsg: null,
+    };
+
+    try {
+      state.items = JSON.parse(localStorage.getItem(ITEMS_KEY) || "[]");
+      state.customStores = JSON.parse(localStorage.getItem(STORES_KEY) || "[]");
+    } catch {}
+
+    function esc(str) {
+      return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function getAllStores() {
+      const raw = [...Object.keys(DEFAULT_STORES), ...state.customStores, ...state.items.map((i) => i.store)];
+      const out = [];
+      for (const s of raw) {
+        const t = (s || "").trim();
+        if (t && !out.some((e) => e.toLowerCase() === t.toLowerCase())) out.push(t);
+      }
+      return out;
+    }
+
+    function storeBadgeClass(store) {
+      const key = Object.keys(DEFAULT_STORES).find((k) => k.toLowerCase() === String(store).toLowerCase());
+      return (key && DEFAULT_STORES[key]) || "bg-emerald-100 text-emerald-900 border-emerald-300";
+    }
+
+    function resolveStore(rawName) {
+      const trimmed = String(rawName || "").trim();
+      if (!trimmed) return "Generelt";
+      const all = getAllStores();
+      return all.find((s) => s.toLowerCase() === trimmed.toLowerCase()) || trimmed[0].toUpperCase() + trimmed.slice(1);
+    }
+
+    function ensureStoreExists(storeName) {
+      const canonical = resolveStore(storeName);
+      const all = getAllStores();
+      if (canonical && !all.some((s) => s.toLowerCase() === canonical.toLowerCase())) {
+        state.customStores = [...state.customStores, canonical];
+        try {
+          localStorage.setItem(STORES_KEY, JSON.stringify(state.customStores));
+        } catch {}
+        if (state.user) {
+          setDoc(
+            doc(db, "shoppingLists", state.user.uid),
+            { customStores: state.customStores, updatedAt: Date.now() },
+            { merge: true }
+          ).catch(() => {});
+        }
+      }
+      return canonical;
+    }
+
+    function saveItems(nextItems) {
+      state.items = nextItems;
+      try {
+        localStorage.setItem(ITEMS_KEY, JSON.stringify(nextItems));
+        state.errorMsg = null;
+      } catch {
+        state.errorMsg = "Lagerplads er fuld i browseren. Slet gamle billeder eller købte varer.";
+      }
+      if (state.user) {
+        setDoc(
+          doc(db, "shoppingLists", state.user.uid),
+          { items: JSON.parse(JSON.stringify(nextItems)), updatedAt: Date.now() },
+          { merge: true }
+        ).catch(() => {});
+      }
+      render();
+    }
+
+    // Client-side link preview (Microlink -> AllOrigins CORS proxy -> URL slug fallback)
+    async function fetchLinkPreview(rawUrl) {
+      const url = rawUrl.trim();
+      const base = extractPreview("", url);
+
+      try {
+        const res = await fetch(`https://api.microlink.io/?url=${encodeURIComponent(url)}`);
+        if (res.ok) {
+          const j = await res.json();
+          if (j?.status === "success" && j.data?.title) {
+            const parsed = extractPreview(`<meta property="og:title" content="${j.data.title}">`, url);
+            return {
+              title: parsed.title || j.data.title,
+              image: j.data.image?.url || "",
+              siteName: base.siteName,
+            };
+          }
+        }
+      } catch {}
+
+      try {
+        const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`);
+        if (res.ok) {
+          const html = (await res.text()).slice(0, 300_000);
+          const preview = extractPreview(html, url);
+          if (preview.hasRealMeta) return preview;
+        }
+      } catch {}
+
+      return base;
+    }
+
+    async function fetchPreviewForItem(itemId, url) {
+      if (!/^https?:\/\//i.test(url.trim())) return;
+      state.loadingPreviewId = itemId;
+      render();
+      try {
+        const data = await fetchLinkPreview(url);
+        const all = getAllStores();
+        const siteStore = (data.siteName || "").trim();
+        const matchedStore =
+          all.find((s) => siteStore && siteStore.toLowerCase().includes(s.toLowerCase())) || siteStore;
+        const canonicalStore = matchedStore ? ensureStoreExists(matchedStore) : "";
+
+        const next = state.items.map((it) => {
+          if (it.id !== itemId) return it;
+          return {
+            ...it,
+            title: it.title === url.trim() || !it.title ? data.title || it.title : it.title,
+            image: it.image || data.image || undefined,
+            store:
+              (it.store === "Generelt" || it.store === "Diverse") && canonicalStore
+                ? canonicalStore
+                : it.store,
+          };
+        });
+        state.loadingPreviewId = null;
+        saveItems(next);
+      } catch {
+        state.loadingPreviewId = null;
+        render();
+      }
+    }
+
+    function addItem(rawInput) {
+      const all = getAllStores();
+      const parsed = parseItemInput(rawInput, all);
+      if (!parsed) return;
+      const { title, store: parsedStore, isUrl } = parsed;
+      const rawTargetStore =
+        !isUrl && parsedStore === "Generelt" && state.storeFilter !== "Alle" ? state.storeFilter : parsedStore;
+      const targetStore = ensureStoreExists(rawTargetStore);
+
+      if (!isUrl) {
+        const existing = state.items.find(
+          (it) =>
+            !it.checked &&
+            it.title.toLowerCase() === title.toLowerCase() &&
+            it.store.toLowerCase() === targetStore.toLowerCase()
+        );
+        if (existing) {
+          state.quickTitle = "";
+          saveItems(state.items.map((it) => (it.id === existing.id ? { ...it, qty: it.qty + 1 } : it)));
+          return;
+        }
+      }
+
+      const id =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+      const newItem = {
+        id,
+        title,
+        store: targetStore,
+        qty: 1,
+        unit: "stk",
+        checked: false,
+        url: isUrl ? title : undefined,
+        createdAt: Date.now(),
+      };
+      state.quickTitle = "";
+      if (isUrl) state.expandedId = id;
+      saveItems([newItem, ...state.items]);
+      if (isUrl) fetchPreviewForItem(id, title);
+    }
+
+    function compressImage(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const img = new Image();
+          img.onload = () => {
+            const max = 400;
+            const scale = Math.min(1, max / Math.max(img.width, img.height));
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.round(img.width * scale);
+            canvas.height = Math.round(img.height * scale);
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return reject();
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            resolve(canvas.toDataURL("image/jpeg", 0.75));
+          };
+          img.onerror = reject;
+          img.src = reader.result;
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // Ensure UI renders even if Firebase Auth takes long on file://
+    setTimeout(() => {
+      if (!state.authReady) {
+        state.authReady = true;
+        render();
+      }
+    }, 1200);
+
+    let unsubList = null;
+    onAuthStateChanged(auth, (user) => {
+      state.user = user;
+      state.authReady = true;
+      if (unsubList) {
+        unsubList();
+        unsubList = null;
+      }
+      if (user) {
+        const ref = doc(db, "shoppingLists", user.uid);
+        unsubList = onSnapshot(
+          ref,
+          (snap) => {
+            if (snap.exists()) {
+              const data = snap.data();
+              state.items = Array.isArray(data.items) ? data.items : [];
+              state.customStores = Array.isArray(data.customStores) ? data.customStores : [];
+              try {
+                localStorage.setItem(ITEMS_KEY, JSON.stringify(state.items));
+                localStorage.setItem(STORES_KEY, JSON.stringify(state.customStores));
+              } catch {}
+              render();
+            } else if (state.items.length > 0 || state.customStores.length > 0) {
+              setDoc(
+                ref,
+                {
+                  items: JSON.parse(JSON.stringify(state.items)),
+                  customStores: state.customStores,
+                  updatedAt: Date.now(),
+                },
+                { merge: true }
+              ).catch(() => {});
+            }
+          },
+          (err) => {
+            state.errorMsg = `Firestore synkroniseringsfejl: ${err.message}`;
+            render();
+          }
+        );
+      }
+      render();
+    });
+
+    function getStoreSuggestions() {
+      const trimmed = state.quickTitle.trim();
+      if (/^https?:\/\//i.test(trimmed)) return { slashIdx: -1, itemPrefix: "", storeQuery: "", suggestions: [] };
+      const slashIdx = state.quickTitle.indexOf("/");
+      if (slashIdx === -1) return { slashIdx: -1, itemPrefix: "", storeQuery: "", suggestions: [] };
+      const itemPrefix = state.quickTitle.slice(0, slashIdx);
+      const storeQuery = state.quickTitle.slice(slashIdx + 1).trim();
+      if (!itemPrefix.trim()) return { slashIdx: -1, itemPrefix: "", storeQuery: "", suggestions: [] };
+      const suggestions = getAllStores().filter((s) => s.toLowerCase().includes(storeQuery.toLowerCase()));
+      return { slashIdx, itemPrefix, storeQuery, suggestions };
+    }
+
+    function renderDropdown() {
+      const container = document.getElementById("store-dropdown-container");
+      if (!container) return;
+      const { slashIdx, itemPrefix, storeQuery, suggestions } = getStoreSuggestions();
+      if (slashIdx === -1 || !itemPrefix.trim()) {
+        container.innerHTML = "";
+        return;
+      }
+      const all = getAllStores();
+      const showNew = storeQuery && !all.some((s) => s.toLowerCase() === storeQuery.toLowerCase());
+      container.innerHTML = `
+        <ul role="listbox" class="mt-2 rounded-xl border border-slate-200 bg-white shadow-lg divide-y divide-slate-100 max-h-48 overflow-y-auto">
+          ${suggestions
+            .map(
+              (store, idx) => `
+            <li>
+              <button type="button" data-pick-store="${esc(store)}"
+                class="w-full flex items-center justify-between px-3 py-2 text-sm text-left transition ${
+                  idx === state.activeStoreIdx ? "bg-slate-100 font-medium" : "hover:bg-slate-50"
+                }">
+                <span>${esc(itemPrefix.trim())} <span class="text-slate-400">→</span>
+                  <span class="text-xs font-semibold px-2 py-0.5 rounded-full border ${storeBadgeClass(store)}">${esc(store)}</span>
+                </span>
+                <span class="text-xs text-slate-400">Vælg</span>
+              </button>
+            </li>`
+            )
+            .join("")}
+          ${
+            showNew
+              ? `<li>
+              <button type="button" data-pick-store="${esc(storeQuery)}"
+                class="w-full flex items-center justify-between px-3 py-2 text-sm text-left text-emerald-700 hover:bg-emerald-50/60">
+                <span>+ Opret ny butik: <strong>${esc(resolveStore(storeQuery))}</strong></span>
+                <span class="text-xs">Enter</span>
+              </button>
+            </li>`
+              : ""
+          }
+        </ul>
+      `;
+      container.querySelectorAll("[data-pick-store]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const st = btn.getAttribute("data-pick-store");
+          addItem(`${itemPrefix.trim()}/${st}`);
+        });
+      });
+    }
+
+    function render() {
+      const root = document.getElementById("app");
+      if (!state.authReady) {
+        root.innerHTML = `<div class="max-w-sm mx-auto px-4 py-20 text-center text-sm text-slate-400">Indlæser...</div>`;
+        return;
+      }
+
+      if (!state.user && !state.localMode) {
+        root.innerHTML = `
+          <main class="max-w-sm mx-auto px-4 py-16">
+            <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+              <h1 class="text-xl font-bold text-slate-900 mb-1">🛒 Indkøbsliste</h1>
+              <p class="text-xs text-slate-500 mb-5">Log ind én gang – enheden husker dit login automatisk fremover.</p>
+              ${
+                state.authError
+                  ? `<div class="mb-4 rounded-xl bg-red-50 border border-red-200 px-3 py-2 text-xs text-red-700">${esc(state.authError)}</div>`
+                  : ""
+              }
+              <form id="auth-form" class="space-y-3">
+                <input id="auth-email" type="email" required placeholder="E-mail"
+                  class="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                <input id="auth-pass" type="password" required placeholder="Adgangskode"
+                  class="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                <button type="submit" class="w-full rounded-xl bg-slate-900 text-white py-2.5 text-sm font-medium hover:bg-slate-800 transition">
+                  ${state.isRegistering ? "Opret konto" : "Log ind"}
+                </button>
+              </form>
+              <button id="google-btn" type="button"
+                class="w-full mt-2.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 py-2.5 text-sm font-medium transition">
+                Fortsæt med Google
+              </button>
+              <button id="toggle-reg-btn" type="button" class="w-full mt-4 text-xs text-slate-500 hover:text-slate-800 underline block">
+                ${state.isRegistering ? "Har du allerede en konto? Log ind" : "Ny bruger? Opret konto"}
+              </button>
+              <button id="local-mode-btn" type="button" class="w-full mt-3 text-xs text-slate-400 hover:text-slate-600">
+                Fortsæt lokalt uden login →
+              </button>
+            </div>
+          </main>
+        `;
+        document.getElementById("auth-form").addEventListener("submit", async (e) => {
+          e.preventDefault();
+          state.authError = null;
+          const email = document.getElementById("auth-email").value.trim();
+          const pass = document.getElementById("auth-pass").value;
+          try {
+            if (state.isRegistering) await createUserWithEmailAndPassword(auth, email, pass);
+            else await signInWithEmailAndPassword(auth, email, pass);
+          } catch (err) {
+            state.authError = err.message || "Login fejlede";
+            render();
+          }
+        });
+        document.getElementById("google-btn").addEventListener("click", async () => {
+          state.authError = null;
+          try {
+            await signInWithPopup(auth, new GoogleAuthProvider());
+          } catch (err) {
+            state.authError = err.message || "Google-login fejlede (kræver http/https fremfor lokal fil)";
+            render();
+          }
+        });
+        document.getElementById("toggle-reg-btn").addEventListener("click", () => {
+          state.isRegistering = !state.isRegistering;
+          state.authError = null;
+          render();
+        });
+        document.getElementById("local-mode-btn").addEventListener("click", () => {
+          state.localMode = true;
+          render();
+        });
+        return;
+      }
+
+      const allStores = getAllStores();
+      const activeItems = state.items.filter(
+        (it) => !it.checked && (state.storeFilter === "Alle" || it.store.toLowerCase() === state.storeFilter.toLowerCase())
+      );
+      const boughtItems = state.items.filter((it) => it.checked);
+      const storesWithActiveItems = allStores.filter((s) =>
+        activeItems.some((it) => it.store.toLowerCase() === s.toLowerCase())
+      );
+      const filterTabs = [
+        "Alle",
+        ...allStores.filter((s) => state.items.some((i) => !i.checked && i.store.toLowerCase() === s.toLowerCase())),
+      ];
+
+      root.innerHTML = `
+        <main class="max-w-xl mx-auto px-4 py-6 pb-24">
+          <header class="flex items-center justify-between mb-4">
+            <div>
+              <h1 class="text-2xl font-bold tracking-tight text-slate-900">🛒 Indkøbsliste</h1>
+              <div class="flex items-center gap-2 text-xs text-slate-400 mt-0.5">
+                ${
+                  state.user
+                    ? `<span>☁️ ${esc(state.user.email || "Synkroniseret")}</span>
+                       <span>·</span>
+                       <button id="logout-btn" type="button" class="hover:text-slate-700 underline">Log ud</button>`
+                    : `<span>💾 Lokal tilstand</span>
+                       <span>·</span>
+                       <button id="show-login-btn" type="button" class="hover:text-slate-700 underline">Log ind for synk</button>`
+                }
+              </div>
+            </div>
+            <span class="text-sm text-slate-500 font-medium">${state.items.filter((i) => !i.checked).length} mangler</span>
+          </header>
+
+          ${
+            state.errorMsg
+              ? `<div role="alert" class="mb-4 rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-900 flex justify-between items-center">
+                  <span>${esc(state.errorMsg)}</span>
+                  <button id="close-err-btn" class="ml-2 font-bold underline">Luk</button>
+                </div>`
+              : ""
+          }
+
+          <section class="relative bg-white rounded-2xl shadow-sm border border-slate-200 p-3 mb-4">
+            <form id="quick-add-form" class="flex gap-2">
+              <input id="quick-input" type="text" value="${esc(state.quickTitle)}"
+                placeholder="Vare/Butik (f.eks. Mælk/Netto) eller indsæt link..."
+                aria-label="Vare/Butik eller indsæt link"
+                class="flex-1 rounded-xl border border-slate-200 px-3.5 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-slate-900" />
+              <button type="submit" class="rounded-xl bg-slate-900 text-white px-4 py-2.5 font-medium text-sm hover:bg-slate-800 active:scale-95 transition">
+                + Tilføj
+              </button>
+            </form>
+            <div id="store-dropdown-container"></div>
+          </section>
+
+          ${
+            state.items.some((i) => !i.checked)
+              ? `<div class="flex items-center gap-1.5 overflow-x-auto mb-4 pb-1">
+                  ${filterTabs
+                    .map(
+                      (tab) => `
+                    <button type="button" data-filter-tab="${esc(tab)}"
+                      class="text-xs px-3 py-1.5 rounded-xl font-medium shrink-0 transition ${
+                        state.storeFilter === tab
+                          ? "bg-slate-900 text-white shadow-xs"
+                          : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-100"
+                      }">${esc(tab)}</button>`
+                    )
+                    .join("")}
+                </div>`
+              : ""
+          }
+
+          ${
+            storesWithActiveItems.length === 0
+              ? `<div class="text-center py-12 bg-white rounded-2xl border border-slate-200/80 text-slate-400 text-sm">
+                  Ingen varer på listen endnu. Skriv f.eks. "Mælk/Netto" eller indsæt et link ovenfor.
+                </div>`
+              : `<div class="space-y-5">
+                  ${storesWithActiveItems
+                    .map((store) => {
+                      const storeItems = activeItems.filter((it) => it.store.toLowerCase() === store.toLowerCase());
+                      return `
+                        <section class="space-y-2">
+                          <div class="flex items-center gap-2 px-1">
+                            <span class="text-xs font-semibold px-2.5 py-0.5 rounded-full border ${storeBadgeClass(store)}">${esc(store)}</span>
+                            <span class="text-xs text-slate-400">${storeItems.length} stk</span>
+                          </div>
+                          <ul class="bg-white rounded-2xl shadow-xs border border-slate-200 divide-y divide-slate-100 overflow-hidden">
+                            ${storeItems
+                              .map((item) => {
+                                const isExpanded = state.expandedId === item.id;
+                                return `
+                                  <li class="p-3 transition hover:bg-slate-50/60">
+                                    <div class="flex items-center gap-3">
+                                      <input type="checkbox" data-check-id="${esc(item.id)}"
+                                        aria-label="Marker ${esc(item.title)} som købt"
+                                        class="h-5 w-5 rounded-md border-slate-300 text-slate-900 cursor-pointer shrink-0" />
+                                      ${
+                                        item.image
+                                          ? `<img src="${esc(item.image)}" alt="${esc(item.title)}" class="h-11 w-11 rounded-lg object-cover border border-slate-200 shrink-0 bg-slate-100" />`
+                                          : ""
+                                      }
+                                      <button type="button" data-expand-id="${esc(item.id)}" class="flex-1 text-left min-w-0">
+                                        <div class="font-medium text-slate-900 truncate">${esc(item.title)}</div>
+                                        <div class="flex items-center gap-2 text-xs text-slate-500 mt-0.5">
+                                          ${item.note ? `<span class="truncate">${esc(item.note)}</span>` : ""}
+                                          ${item.url ? `<span class="text-blue-600 underline shrink-0">🔗 Link</span>` : ""}
+                                          ${
+                                            state.loadingPreviewId === item.id
+                                              ? `<span class="text-amber-600 animate-pulse">Henter preview...</span>`
+                                              : ""
+                                          }
+                                        </div>
+                                      </button>
+                                      <div class="flex items-center gap-1 shrink-0 bg-slate-100 rounded-xl p-1">
+                                        <button type="button" data-dec-id="${esc(item.id)}" class="w-6 h-6 rounded-lg bg-white text-slate-700 text-sm font-bold shadow-2xs hover:bg-slate-50">−</button>
+                                        <span class="text-xs font-semibold px-1.5 min-w-10 text-center">${item.qty} ${esc(item.unit)}</span>
+                                        <button type="button" data-inc-id="${esc(item.id)}" class="w-6 h-6 rounded-lg bg-white text-slate-700 text-sm font-bold shadow-2xs hover:bg-slate-50">+</button>
+                                      </div>
+                                    </div>
+                                    ${
+                                      isExpanded
+                                        ? `<div class="mt-3 pt-3 border-t border-slate-100 space-y-2.5 text-xs">
+                                            <div class="grid grid-cols-2 gap-2">
+                                              <div>
+                                                <label class="block text-slate-500 mb-1">Titel</label>
+                                                <input type="text" data-edit-field="title" data-item-id="${esc(item.id)}" value="${esc(item.title)}"
+                                                  class="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-sm" />
+                                              </div>
+                                              <div class="flex gap-1.5">
+                                                <div class="flex-1">
+                                                  <label class="block text-slate-500 mb-1">Butik</label>
+                                                  <input type="text" list="stores-datalist" data-edit-field="store" data-item-id="${esc(item.id)}" value="${esc(item.store)}"
+                                                    class="w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm bg-white" />
+                                                  <datalist id="stores-datalist">
+                                                    ${allStores.map((s) => `<option value="${esc(s)}"></option>`).join("")}
+                                                  </datalist>
+                                                </div>
+                                                <div class="w-20">
+                                                  <label class="block text-slate-500 mb-1">Enhed</label>
+                                                  <select data-edit-field="unit" data-item-id="${esc(item.id)}" class="w-full rounded-lg border border-slate-200 px-1.5 py-1.5 text-sm bg-white">
+                                                    ${["stk", "pakke", "kg", "g", "L", "fl", "pose"]
+                                                      .map((u) => `<option value="${u}" ${item.unit === u ? "selected" : ""}>${u}</option>`)
+                                                      .join("")}
+                                                  </select>
+                                                </div>
+                                              </div>
+                                            </div>
+                                            <div>
+                                              <label class="block text-slate-500 mb-1">Link (henter automatisk titel & billede)</label>
+                                              <div class="flex gap-1.5">
+                                                <input type="url" data-edit-field="url" data-item-id="${esc(item.id)}" value="${esc(item.url || "")}" placeholder="https://..."
+                                                  class="flex-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-sm" />
+                                                <button type="button" data-fetch-preview="${esc(item.id)}" class="rounded-lg bg-slate-900 text-white px-2.5 py-1.5 font-medium shrink-0">
+                                                  ${state.loadingPreviewId === item.id ? "Henter..." : "Hent info"}
+                                                </button>
+                                                ${
+                                                  item.url
+                                                    ? `<a href="${esc(item.url)}" target="_blank" rel="noopener noreferrer" class="rounded-lg border border-slate-200 px-2.5 py-1.5 text-slate-700 hover:bg-slate-100 shrink-0">Åbn ↗</a>`
+                                                    : ""
+                                                }
+                                              </div>
+                                            </div>
+                                            <div class="flex items-end gap-2">
+                                              <div class="flex-1">
+                                                <label class="block text-slate-500 mb-1">Billede-URL eller foto</label>
+                                                <input type="text" data-edit-field="image" data-item-id="${esc(item.id)}" value="${esc(item.image || "")}" placeholder="Indsæt billede-link eller vælg foto..."
+                                                  class="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-sm" />
+                                              </div>
+                                              <label class="cursor-pointer rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-700 shrink-0">
+                                                📷 Foto
+                                                <input type="file" accept="image/*" data-photo-id="${esc(item.id)}" class="hidden" />
+                                              </label>
+                                              ${
+                                                item.image
+                                                  ? `<button type="button" data-clear-img="${esc(item.id)}" class="text-slate-400 hover:text-red-600 px-1.5 py-1.5">✕</button>`
+                                                  : ""
+                                              }
+                                            </div>
+                                            <div class="flex items-center gap-2 pt-1">
+                                              <input type="text" data-edit-field="note" data-item-id="${esc(item.id)}" value="${esc(item.note || "")}" placeholder="Note (f.eks. mærke, pris eller placering)..."
+                                                class="flex-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-sm" />
+                                              <button type="button" data-del-id="${esc(item.id)}" class="rounded-lg bg-red-50 text-red-600 hover:bg-red-100 px-3 py-1.5 font-medium shrink-0">Slet</button>
+                                            </div>
+                                          </div>`
+                                        : ""
+                                    }
+                                  </li>
+                                `;
+                              })
+                              .join("")}
+                          </ul>
+                        </section>
+                      `;
+                    })
+                    .join("")}
+                </div>`
+          }
+
+          ${
+            boughtItems.length > 0
+              ? `<section class="mt-8 pt-6 border-t border-slate-200">
+                  <div class="flex items-center justify-between mb-2 px-1">
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                      Købt (${boughtItems.length}) — tryk for at genaktivere
+                    </h2>
+                    <button id="clear-bought-btn" type="button" class="text-xs text-slate-400 hover:text-red-600 font-medium">Ryd købte</button>
+                  </div>
+                  <ul class="bg-white/60 rounded-2xl border border-slate-200/70 divide-y divide-slate-100">
+                    ${boughtItems
+                      .map(
+                        (item) => `
+                      <li class="flex items-center justify-between px-3 py-2 text-sm text-slate-400">
+                        <button type="button" data-uncheck-id="${esc(item.id)}" class="flex items-center gap-2.5 flex-1 text-left hover:text-slate-700">
+                          <span class="h-4 w-4 rounded border border-slate-300 bg-slate-200 flex items-center justify-center text-[10px] text-slate-600">✓</span>
+                          <span class="line-through truncate">${esc(item.title)}</span>
+                          <span class="text-[11px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 no-underline">${esc(item.store)}</span>
+                        </button>
+                        <button type="button" data-del-id="${esc(item.id)}" class="text-slate-300 hover:text-red-500 px-2">✕</button>
+                      </li>`
+                      )
+                      .join("")}
+                  </ul>
+                </section>`
+              : ""
+          }
+        </main>
+      `;
+
+      renderDropdown();
+
+      document.getElementById("logout-btn")?.addEventListener("click", () => signOut(auth));
+      document.getElementById("show-login-btn")?.addEventListener("click", () => {
+        state.localMode = false;
+        render();
+      });
+      document.getElementById("close-err-btn")?.addEventListener("click", () => {
+        state.errorMsg = null;
+        render();
+      });
+
+      const qInput = document.getElementById("quick-input");
+      qInput?.addEventListener("input", (e) => {
+        state.quickTitle = e.target.value;
+        state.activeStoreIdx = 0;
+        renderDropdown();
+      });
+      qInput?.addEventListener("keydown", (e) => {
+        const { itemPrefix, suggestions } = getStoreSuggestions();
+        if (!suggestions.length) return;
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          state.activeStoreIdx = (state.activeStoreIdx + 1) % suggestions.length;
+          renderDropdown();
+        } else if (e.key === "ArrowUp") {
+          e.preventDefault();
+          state.activeStoreIdx = (state.activeStoreIdx - 1 + suggestions.length) % suggestions.length;
+          renderDropdown();
+        } else if (e.key === "Tab" && suggestions[state.activeStoreIdx]) {
+          e.preventDefault();
+          state.quickTitle = `${itemPrefix.trim()}/${suggestions[state.activeStoreIdx]}`;
+          qInput.value = state.quickTitle;
+          renderDropdown();
+        }
+      });
+
+      document.getElementById("quick-add-form")?.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const { itemPrefix, storeQuery, suggestions } = getStoreSuggestions();
+        if (suggestions.length > 0 && suggestions[state.activeStoreIdx]) {
+          const all = getAllStores();
+          const exactTyped = all.some((s) => s.toLowerCase() === storeQuery.toLowerCase());
+          const chosenStore =
+            state.activeStoreIdx > 0 || (storeQuery && exactTyped)
+              ? suggestions[state.activeStoreIdx]
+              : storeQuery || suggestions[0];
+          addItem(`${itemPrefix.trim()}/${chosenStore}`);
+        } else {
+          addItem(state.quickTitle);
+        }
+      });
+
+      root.querySelectorAll("[data-filter-tab]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.storeFilter = btn.getAttribute("data-filter-tab");
+          render();
+        });
+      });
+
+      root.querySelectorAll("[data-check-id]").forEach((cb) => {
+        cb.addEventListener("change", () => {
+          const id = cb.getAttribute("data-check-id");
+          saveItems(state.items.map((it) => (it.id === id ? { ...it, checked: true } : it)));
+        });
+      });
+
+      root.querySelectorAll("[data-uncheck-id]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = btn.getAttribute("data-uncheck-id");
+          saveItems(state.items.map((it) => (it.id === id ? { ...it, checked: false } : it)));
+        });
+      });
+
+      root.querySelectorAll("[data-expand-id]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = btn.getAttribute("data-expand-id");
+          state.expandedId = state.expandedId === id ? null : id;
+          render();
+        });
+      });
+
+      root.querySelectorAll("[data-inc-id]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = btn.getAttribute("data-inc-id");
+          saveItems(state.items.map((it) => (it.id === id ? { ...it, qty: it.qty + 1 } : it)));
+        });
+      });
+
+      root.querySelectorAll("[data-dec-id]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = btn.getAttribute("data-dec-id");
+          const item = state.items.find((it) => it.id === id);
+          if (!item) return;
+          if (item.qty > 1) {
+            saveItems(state.items.map((it) => (it.id === id ? { ...it, qty: it.qty - 1 } : it)));
+          } else {
+            saveItems(state.items.filter((it) => it.id !== id));
+          }
+        });
+      });
+
+      root.querySelectorAll("[data-del-id]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = btn.getAttribute("data-del-id");
+          if (state.expandedId === id) state.expandedId = null;
+          saveItems(state.items.filter((it) => it.id !== id));
+        });
+      });
+
+      root.querySelectorAll("[data-edit-field]").forEach((input) => {
+        input.addEventListener("change", () => {
+          const id = input.getAttribute("data-item-id");
+          const field = input.getAttribute("data-edit-field");
+          const val = input.value;
+          const normalizedVal = field === "store" ? ensureStoreExists(val) : val;
+          saveItems(state.items.map((it) => (it.id === id ? { ...it, [field]: normalizedVal } : it)));
+        });
+      });
+
+      root.querySelectorAll("[data-fetch-preview]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = btn.getAttribute("data-fetch-preview");
+          const urlInput = root.querySelector(`[data-edit-field="url"][data-item-id="${id}"]`);
+          const url = urlInput ? urlInput.value : state.items.find((i) => i.id === id)?.url || "";
+          if (url) {
+            state.items = state.items.map((it) => (it.id === id ? { ...it, url } : it));
+            fetchPreviewForItem(id, url);
+          }
+        });
+      });
+
+      root.querySelectorAll("[data-photo-id]").forEach((input) => {
+        input.addEventListener("change", async (e) => {
+          const id = input.getAttribute("data-photo-id");
+          const file = e.target.files?.[0];
+          if (!file) return;
+          try {
+            const dataUrl = await compressImage(file);
+            saveItems(state.items.map((it) => (it.id === id ? { ...it, image: dataUrl } : it)));
+          } catch {
+            state.errorMsg = "Kunne ikke indlæse billedet.";
+            render();
+          }
+        });
+      });
+
+      root.querySelectorAll("[data-clear-img]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = btn.getAttribute("data-clear-img");
+          saveItems(state.items.map((it) => (it.id === id ? { ...it, image: undefined } : it)));
+        });
+      });
+
+      document.getElementById("clear-bought-btn")?.addEventListener("click", () => {
+        saveItems(state.items.filter((it) => !it.checked));
+      });
+    }
+
+    render();
+  </script>
+</body>
+</html>

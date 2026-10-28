@@ -110,7 +110,8 @@
         (titleMatch ? decodeHtml(titleMatch[1]) : "");
 
       const isBlockedTitle = /^(access denied|just a moment|attention required|403 forbidden|robot check)/i.test(rawTitle);
-      let title = isBlockedTitle ? "" : rawTitle;
+      // Strip shop suffix like " | Køb hos jem & fix"
+      let title = isBlockedTitle ? "" : rawTitle.replace(/\s+\|\s+[^|]+$/, "");
       const hasRealMeta = Boolean(title);
 
       if (!title) {
@@ -265,27 +266,33 @@
       const url = rawUrl.trim();
       const base = extractPreview("", url);
 
+      // CORS proxies first (no daily cap), parsed locally; Microlink last since its free tier is 50 requests/day
+      const proxies = [
+        (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+        (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+      ];
+      for (const proxy of proxies) {
+        try {
+          const res = await fetch(proxy(url), { signal: AbortSignal.timeout(8000) });
+          if (res.ok) {
+            const html = (await res.text()).slice(0, 400_000);
+            const preview = extractPreview(html, url);
+            if (preview.hasRealMeta) return preview;
+          }
+        } catch {}
+      }
+
       try {
         const res = await fetch(`https://api.microlink.io/?url=${encodeURIComponent(url)}`);
         if (res.ok) {
           const j = await res.json();
           if (j?.status === "success" && j.data?.title) {
-            const parsed = extractPreview(`<meta property="og:title" content="${j.data.title}">`, url);
             return {
-              title: parsed.title || j.data.title,
+              title: String(j.data.title).replace(/\s+\|\s+[^|]+$/, ""),
               image: j.data.image?.url || "",
               siteName: base.siteName,
             };
           }
-        }
-      } catch {}
-
-      try {
-        const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`);
-        if (res.ok) {
-          const html = (await res.text()).slice(0, 300_000);
-          const preview = extractPreview(html, url);
-          if (preview.hasRealMeta) return preview;
         }
       } catch {}
 
